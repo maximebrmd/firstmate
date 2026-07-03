@@ -202,6 +202,18 @@ path_is_ancestor_of() {
   return 1
 }
 
+# A captured pane path is the real treehouse lease only when it is an existing
+# directory under the treehouse root AND a git worktree. This rejects shell-init
+# noise (e.g. a transient ~/.oh-my-zsh cwd) that can momentarily differ from the
+# project dir before `treehouse get` enters the worktree.
+is_treehouse_worktree() {
+  local path=$1 root=$2
+  [ -d "$path" ] || return 1
+  path_is_ancestor_of "$root" "$path" || return 1
+  [ "$(git -C "$path" rev-parse --is-inside-work-tree 2>/dev/null)" = "true" ] || return 1
+  return 0
+}
+
 validate_firstmate_home_for_spawn() {
   local id=$1 home=$2 abs_home abs_active_home abs_root marker_id
   abs_home=$(resolved_existing_dir "$home") || return 1
@@ -331,10 +343,18 @@ tmux new-window -d -t "$SES" -n "$W" -c "$PROJ_ABS"
 if [ "$KIND" != secondmate ]; then
   tmux send-keys -t "$T" 'treehouse get' Enter
 
-  # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
+  # The lease path lives under the treehouse root; default to ~/.treehouse but
+  # honor an explicit override for non-default treehouse roots.
+  TH_ROOT="${FM_TREEHOUSE_ROOT:-$HOME/.treehouse}"
+
+  # Wait for the treehouse subshell: the pane's cwd moves from the project to the
+  # worktree. Only accept a captured path that is genuinely a git worktree under
+  # the treehouse root - a bare "differs from the project dir" check once recorded
+  # shell-init noise (e.g. a transient ~/.oh-my-zsh cwd during zsh startup) that
+  # appears before `treehouse get` lands.
   for _ in $(seq 1 60); do
     p=$(tmux display-message -p -t "$T" '#{pane_current_path}' 2>/dev/null || true)
-    if [ -n "$p" ] && [ "$p" != "$PROJ_ABS" ]; then
+    if [ -n "$p" ] && [ "$p" != "$PROJ_ABS" ] && is_treehouse_worktree "$p" "$TH_ROOT"; then
       WT="$p"
       break
     fi
