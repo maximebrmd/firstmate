@@ -5,8 +5,16 @@
 # by JavaScript and TypeScript integrations. It is the single owner of current
 # construction, current parsing, and narrow pre-protocol transcript parsing.
 #
-# Current generic wire form:
+# Current generic wire form, for every kind INJECTED into a running agent:
 #   U+2063 FIRSTMATE_OP: v1 <kind>: <body>
+#
+# Current generic wire form, for a kind listed in FM_OPERATIONAL_UNMARKED_KINDS:
+#   FIRSTMATE_OP: v1 <kind>: <body>
+#
+# The unmarked form is the marked form minus its leading U+2063, and is accepted
+# on parse ONLY for a declared unmarked kind, so no injected kind can be forged
+# without the mark. See FM_OPERATIONAL_UNMARKED_KINDS below for why launch-brief
+# is the one kind that carries it.
 #
 # The landed U+2063 + "FIRSTMATE_OP: " prefix is permanent compatibility.
 # The version and kind header make current inputs structurally typed without
@@ -30,6 +38,42 @@ FM_OPERATIONAL_VERSION=v1
 FM_OPERATIONAL_HEADER_PREFIX="${FM_OPERATIONAL_PREFIX}${FM_OPERATIONAL_VERSION} "
 FM_OPERATIONAL_KINDS='session-start watcher turn-end-guard away-supervisor launch-brief'
 
+# launch-brief is the one kind that is never INJECTED into a running agent: it is
+# passed as the agent's argv launch prompt by bin/fm-spawn.sh. The leading U+2063
+# mark exists to make injected input unforgeable by a human typing at a composer,
+# a property an argv launch prompt cannot need, so launch-brief carries the same
+# versioned envelope without the zero-width mark. Every injected kind keeps the
+# marked envelope and its anti-forgery guarantee unchanged.
+#
+# This is load-bearing, not cosmetic: agents set their terminal pane title from
+# their own launch prompt, and tmux 3.7b aborts the ENTIRE server on a title
+# containing U+2063 ("utf8proc_wcwidth(02063) returned 0" ->
+# "fatal: xreallocarray: zero size"), killing every window at once. The header
+# alone is not enough for that: an unmarked kind's body is captain-supplied
+# text, so fm_operational_input_encode strips U+2063 from it and the whole
+# envelope carries no mark in any position.
+FM_OPERATIONAL_UNMARKED_KINDS='launch-brief'
+# Derived, never re-typed: the unmarked header is exactly the marked header with
+# its leading U+2063 removed, so the two forms cannot drift apart.
+FM_OPERATIONAL_UNMARKED_HEADER_PREFIX="${FM_OPERATIONAL_HEADER_PREFIX#"$FM_OPERATIONAL_MARK"}"
+
+fm_operational_kind_is_unmarked() {  # <kind>
+  case " $FM_OPERATIONAL_UNMARKED_KINDS " in
+    *" $1 "*) return 0 ;;
+  esac
+  return 1
+}
+
+fm_operational_header_for_kind() {  # <kind> <result-var>
+  local header_kind=${1-} header_result_var=${2-}
+  [ -n "$header_result_var" ] || return 2
+  if fm_operational_kind_is_unmarked "$header_kind"; then
+    printf -v "$header_result_var" '%s' "$FM_OPERATIONAL_UNMARKED_HEADER_PREFIX"
+  else
+    printf -v "$header_result_var" '%s' "$FM_OPERATIONAL_HEADER_PREFIX"
+  fi
+}
+
 # Compatibility name retained for the away-mode owner and its tests.
 # shellcheck disable=SC2034 # Public source-library variable used by callers.
 FM_INJECT_MARK=$FM_OPERATIONAL_MARK
@@ -47,49 +91,83 @@ fm_operational_kind_is_current() {  # <kind>
   return 1
 }
 
+# Convention for every <result-var> function below: EVERY local is prefixed with
+# a per-function tag, with no exception for the parameters. This is not
+# stylistic. Under bash dynamic scoping an unprefixed local silently shadows a
+# caller's own result-variable name, so the write lands on the local, the
+# function still returns 0, and the caller reads an empty value instead of an
+# error. tests/fm-operational-input.test.sh locks this by round-tripping the
+# public entry points through every plausible caller-side name.
 fm_operational_input_encode() {  # <generic-kind> <body> <result-var>
-  local kind=${1-} body=${2-} result_var=${3-}
-  [ -n "$result_var" ] || return 2
-  fm_operational_kind_is_current "$kind" || return 2
-  [ -n "$body" ] || return 2
-  printf -v "$result_var" '%s%s: %s' "$FM_OPERATIONAL_HEADER_PREFIX" "$kind" "$body"
+  local encode_kind=${1-} encode_body=${2-} encode_result_var=${3-} encode_header
+  [ -n "$encode_result_var" ] || return 2
+  fm_operational_kind_is_current "$encode_kind" || return 2
+  [ -n "$encode_body" ] || return 2
+  fm_operational_header_for_kind "$encode_kind" encode_header || return 2
+  # An unmarked kind guarantees a mark-free envelope in every position, not just
+  # in its header: the body is captain-supplied text and a pane title built from
+  # it aborts the whole tmux server on a single U+2063. A body that is nothing
+  # but marks encodes to no body at all, which is invalid use.
+  if fm_operational_kind_is_unmarked "$encode_kind"; then
+    encode_body=${encode_body//"$FM_OPERATIONAL_MARK"/}
+    [ -n "$encode_body" ] || return 2
+  fi
+  printf -v "$encode_result_var" '%s%s: %s' "$encode_header" "$encode_kind" "$encode_body"
 }
 
 fm_operational_input_construct() {  # <kind> <body> <result-var>
-  local kind=${1-} body=${2-} result_var=${3-}
-  [ -n "$result_var" ] && [ -n "$body" ] || return 2
-  if [ "$kind" = from-firstmate ]; then
-    fm_message_mark_from_firstmate "$body" "$result_var"
+  local construct_kind=${1-} construct_body=${2-} construct_result_var=${3-}
+  [ -n "$construct_result_var" ] && [ -n "$construct_body" ] || return 2
+  if [ "$construct_kind" = from-firstmate ]; then
+    fm_message_mark_from_firstmate "$construct_body" "$construct_result_var"
     return
   fi
-  fm_operational_input_encode "$kind" "$body" "$result_var"
+  fm_operational_input_encode "$construct_kind" "$construct_body" "$construct_result_var"
+}
+
+# Single owner of current-envelope splitting for both the marked and the
+# unmarked header. An unmarked header is accepted only for a kind declared in
+# FM_OPERATIONAL_UNMARKED_KINDS, so no injected kind can be forged without the
+# zero-width mark.
+fm_operational_generic_split() {  # <message> <kind-result-var> <body-result-var>
+  local split_message=${1-} split_kind_var=${2-} split_body_var=${3-}
+  local split_header split_remainder split_kind split_body
+  [ -n "$split_kind_var" ] && [ -n "$split_body_var" ] || return 2
+  case "$split_message" in
+    "$FM_OPERATIONAL_HEADER_PREFIX"*': '?*) split_header=$FM_OPERATIONAL_HEADER_PREFIX ;;
+    "$FM_OPERATIONAL_UNMARKED_HEADER_PREFIX"*': '?*) split_header=$FM_OPERATIONAL_UNMARKED_HEADER_PREFIX ;;
+    *) return 1 ;;
+  esac
+  split_remainder=${split_message#"$split_header"}
+  split_kind=${split_remainder%%': '*}
+  fm_operational_kind_is_current "$split_kind" || return 1
+  if [ "$split_header" = "$FM_OPERATIONAL_UNMARKED_HEADER_PREFIX" ]; then
+    fm_operational_kind_is_unmarked "$split_kind" || return 1
+  fi
+  split_body=${split_remainder#"${split_kind}: "}
+  [ "$split_body" != "$split_remainder" ] && [ -n "$split_body" ] || return 1
+  printf -v "$split_kind_var" '%s' "$split_kind"
+  printf -v "$split_body_var" '%s' "$split_body"
 }
 
 fm_operational_generic_kind() {  # <message> <result-var>
-  local message=${1-} result_var=${2-} remainder parsed_kind body
-  [ -n "$result_var" ] || return 2
-  case "$message" in
-    "$FM_OPERATIONAL_HEADER_PREFIX"*': '?*) ;;
-    *) return 1 ;;
-  esac
-  remainder=${message#"$FM_OPERATIONAL_HEADER_PREFIX"}
-  parsed_kind=${remainder%%': '*}
-  fm_operational_kind_is_current "$parsed_kind" || return 1
-  body=${remainder#"${parsed_kind}: "}
-  [ "$body" != "$remainder" ] && [ -n "$body" ] || return 1
-  printf -v "$result_var" '%s' "$parsed_kind"
+  # shellcheck disable=SC2034 # Declared local so the splitter's write stays scoped.
+  local gkind_message=${1-} gkind_result_var=${2-} gkind_parsed_kind gkind_parsed_body
+  [ -n "$gkind_result_var" ] || return 2
+  fm_operational_generic_split "$gkind_message" gkind_parsed_kind gkind_parsed_body || return 1
+  printf -v "$gkind_result_var" '%s' "$gkind_parsed_kind"
 }
 
 fm_operational_input_kind() {  # <message> <result-var>
-  local message=${1-} result_var=${2-} current_kind
-  [ -n "$result_var" ] || return 2
-  if fm_operational_generic_kind "$message" current_kind; then
-    printf -v "$result_var" '%s' "$current_kind"
+  local kind_message=${1-} kind_result_var=${2-} kind_current
+  [ -n "$kind_result_var" ] || return 2
+  if fm_operational_generic_kind "$kind_message" kind_current; then
+    printf -v "$kind_result_var" '%s' "$kind_current"
     return 0
   fi
-  case "$message" in
+  case "$kind_message" in
     "$FM_FROMFIRST_MARK"?*)
-      printf -v "$result_var" '%s' from-firstmate
+      printf -v "$kind_result_var" '%s' from-firstmate
       return 0
       ;;
   esac
@@ -97,17 +175,17 @@ fm_operational_input_kind() {  # <message> <result-var>
 }
 
 fm_operational_input_body() {  # <current-message> <result-var>
-  local message=${1-} result_var=${2-} current_kind parsed_body
-  [ -n "$result_var" ] || return 2
-  if fm_operational_generic_kind "$message" current_kind; then
-    parsed_body=${message#"${FM_OPERATIONAL_HEADER_PREFIX}${current_kind}: "}
-    printf -v "$result_var" '%s' "$parsed_body"
+  # shellcheck disable=SC2034 # Declared local so the splitter's write stays scoped.
+  local body_message=${1-} body_result_var=${2-} body_current_kind body_parsed
+  [ -n "$body_result_var" ] || return 2
+  if fm_operational_generic_split "$body_message" body_current_kind body_parsed; then
+    printf -v "$body_result_var" '%s' "$body_parsed"
     return 0
   fi
-  case "$message" in
+  case "$body_message" in
     "$FM_FROMFIRST_MARK"?*)
-      parsed_body=${message#"$FM_FROMFIRST_MARK"}
-      printf -v "$result_var" '%s' "$parsed_body"
+      body_parsed=${body_message#"$FM_FROMFIRST_MARK"}
+      printf -v "$body_result_var" '%s' "$body_parsed"
       return 0
       ;;
   esac
@@ -125,34 +203,34 @@ FM_LEGACY_TURNEND_PREFIX=$'TURN WOULD END BLIND - supervision is off. The watche
 FM_LEGACY_AWAY_PREFIX="${FM_OPERATIONAL_MARK}Supervisor escalate ("
 
 fm_legacy_operational_input_kind() {  # <message> <result-var>
-  local message=${1-} result_var=${2-}
-  [ -n "$result_var" ] || return 2
+  local legacy_message=${1-} legacy_result_var=${2-}
+  [ -n "$legacy_result_var" ] || return 2
 
   # PR 899 landed an untyped FIRSTMATE_OP prefix. Its subtype cannot be
   # recovered without body prose, so it is explicitly generic.
-  case "$message" in
+  case "$legacy_message" in
     "$FM_OPERATIONAL_PREFIX"?*)
-      printf -v "$result_var" '%s' legacy-operational
+      printf -v "$legacy_result_var" '%s' legacy-operational
       return 0
       ;;
   esac
 
-  if [ "$message" = "$FM_LEGACY_SESSIONSTART" ]; then
-    printf -v "$result_var" '%s' session-start
+  if [ "$legacy_message" = "$FM_LEGACY_SESSIONSTART" ]; then
+    printf -v "$legacy_result_var" '%s' session-start
     return 0
   fi
-  case "$message" in
+  case "$legacy_message" in
     "$FM_LEGACY_AWAY_PREFIX"*)
-      printf -v "$result_var" '%s' away-supervisor
+      printf -v "$legacy_result_var" '%s' away-supervisor
       return 0
       ;;
     "$FM_LEGACY_WATCHER_PREFIX"*"$FM_LEGACY_WATCHER_SUFFIX")
-      [ "${#message}" -gt "$(( ${#FM_LEGACY_WATCHER_PREFIX} + ${#FM_LEGACY_WATCHER_SUFFIX} ))" ] || return 1
-      printf -v "$result_var" '%s' watcher
+      [ "${#legacy_message}" -gt "$(( ${#FM_LEGACY_WATCHER_PREFIX} + ${#FM_LEGACY_WATCHER_SUFFIX} ))" ] || return 1
+      printf -v "$legacy_result_var" '%s' watcher
       return 0
       ;;
     "$FM_LEGACY_TURNEND_PREFIX"?*)
-      printf -v "$result_var" '%s' turn-end-guard
+      printf -v "$legacy_result_var" '%s' turn-end-guard
       return 0
       ;;
   esac
@@ -160,38 +238,38 @@ fm_legacy_operational_input_kind() {  # <message> <result-var>
 }
 
 fm_operational_input_classify() {  # <message> <result-var>
-  local message=${1-} result_var=${2-} classified_kind
-  [ -n "$result_var" ] || return 2
-  if fm_operational_input_kind "$message" classified_kind ||
-     fm_legacy_operational_input_kind "$message" classified_kind; then
-    printf -v "$result_var" '%s' "$classified_kind"
+  local classify_message=${1-} classify_result_var=${2-} classify_kind
+  [ -n "$classify_result_var" ] || return 2
+  if fm_operational_input_kind "$classify_message" classify_kind ||
+     fm_legacy_operational_input_kind "$classify_message" classify_kind; then
+    printf -v "$classify_result_var" '%s' "$classify_kind"
     return 0
   fi
   return 1
 }
 
 fm_message_from_firstmate() {  # <message>
-  local kind
-  fm_operational_input_kind "${1-}" kind && [ "$kind" = from-firstmate ]
+  local fromfirst_kind
+  fm_operational_input_kind "${1-}" fromfirst_kind && [ "$fromfirst_kind" = from-firstmate ]
 }
 
 fm_message_mark_from_firstmate() {  # <message> <result-var>
-  local message=${1-} result_var=${2-} transformed
-  [ -n "$result_var" ] || return 2
-  if fm_message_from_firstmate "$message"; then
-    transformed=$message
+  local mark_message=${1-} mark_result_var=${2-} mark_transformed
+  [ -n "$mark_result_var" ] || return 2
+  if fm_message_from_firstmate "$mark_message"; then
+    mark_transformed=$mark_message
   else
-    transformed="${FM_FROMFIRST_MARK}${message}"
+    mark_transformed="${FM_FROMFIRST_MARK}${mark_message}"
   fi
-  printf -v "$result_var" '%s' "$transformed"
+  printf -v "$mark_result_var" '%s' "$mark_transformed"
 }
 
 fm_operational_read_stdin() {  # <result-var>
-  local result_var=${1-} value
-  [ -n "$result_var" ] || return 2
-  value=$(cat; printf x)
-  value=${value%x}
-  printf -v "$result_var" '%s' "$value"
+  local stdin_result_var=${1-} stdin_value
+  [ -n "$stdin_result_var" ] || return 2
+  stdin_value=$(cat; printf x)
+  stdin_value=${stdin_value%x}
+  printf -v "$stdin_result_var" '%s' "$stdin_value"
 }
 
 fm_operational_usage() {
