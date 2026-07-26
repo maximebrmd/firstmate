@@ -18,3 +18,40 @@ config/x-mode.env
 config/cmux-socket-password
 config/wedge-alarm
 config/herdr-presentation-spaces
+
+# Third-party skills installed locally by a skills installer, plus its lockfile.
+# .agents/skills/ and skills/ track firstmate's OWN skills, every one of which
+# carries metadata.internal=true; these are fetched from external sources
+# (vercel-labs/agent-skills, resend/resend-cli, docs.stripe.com), pinned by
+# content hash in skills-lock.json, and reproducible by reinstalling. They are
+# local installs in one operator's home, not material this shared template
+# should ship to every firstmate user, so they stay untracked here. The entries
+# under skills/ are installer-created symlinks into .agents/skills/.
+skills-lock.json
+.agents/skills/deploy-to-vercel/
+.agents/skills/resend-cli/
+.agents/skills/stripe-best-practices/
+.agents/skills/stripe-directory/
+.agents/skills/stripe-projects/
+.agents/skills/upgrade-stripe/
+.agents/skills/vercel-cli-with-tokens/
+.agents/skills/vercel-composition-patterns/
+.agents/skills/vercel-optimize/
+.agents/skills/vercel-react-best-practices/
+.agents/skills/vercel-react-native-skills/
+.agents/skills/vercel-react-view-transitions/
+.agents/skills/web-design-guidelines/
+.agents/skills/writing-guidelines/
+skills/stripe-best-practices
+skills/stripe-directory
+skills/stripe-projects
+skills/upgrade-stripe
+
+# Local config for other agent tools sharing this checkout, and one operator's
+# scratch output. Machine-local like the config/ entries above; .mcp.json also
+# carries a live project reference.
+.kiro/
+.qwen/
+.windsurf/
+.mcp.json
+domain-availability.csv
