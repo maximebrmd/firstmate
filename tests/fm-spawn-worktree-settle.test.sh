@@ -90,12 +90,19 @@ EOF
 
 run_settle_spawn() {
   local id=$1
+  run_settle_spawn_with_pane "$id" "$WT_DIR" "$STALE_READS"
+}
+
+# Same launch, with the eventual (post-stale) pane path and stale-read count
+# chosen per case, so a case can model a pane that never reaches a worktree.
+run_settle_spawn_with_pane() {  # <id> <eventual-pane-path> <stale-reads>
+  local id=$1 pane=$2 stale_reads=$3
   FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
     FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
-    FM_FAKE_PANE_PATH="$WT_DIR" FM_FAKE_PANE_STALE="$STALE_DIR" \
-    FM_FAKE_PANE_STALE_READS="$STALE_READS" FM_FAKE_PANE_COUNTFILE="$COUNTFILE" \
+    FM_FAKE_PANE_PATH="$pane" FM_FAKE_PANE_STALE="$STALE_DIR" \
+    FM_FAKE_PANE_STALE_READS="$stale_reads" FM_FAKE_PANE_COUNTFILE="$COUNTFILE" \
     PATH="$FAKEBIN_DIR:$PATH" \
     "$SPAWN" "$id" "$PROJ_DIR" 2>&1
 }
@@ -141,7 +148,56 @@ test_already_settled_pane_costs_one_confirm_sleep() {
   pass "an already-settled pane confirms via the existing inter-poll sleep, not an extra full cycle"
 }
 
+# The other direction of the same settle rule. A pane that never reaches a
+# worktree of the project must be refused as an isolation failure, and refused
+# PROMPTLY: falling through to the 60s timeout reports a generic "did not enter
+# a worktree" that reads as a hang rather than the refusal it is.
+test_settled_non_worktree_refuses_promptly() {
+  local rec id out status start end elapsed notgit
+  id=settle-notgit-z3
+  rec=$(make_settle_case settle-notgit "$id" 0)
+  read_settle_record "$rec"
+  # A plain directory that is not a worktree of anything, reported forever.
+  notgit="$TMP_ROOT/settle-notgit/pane-not-a-worktree"
+  mkdir -p "$notgit"
+
+  start=$(date +%s)
+  out=$(run_settle_spawn_with_pane "$id" "$notgit" 0)
+  status=$?
+  end=$(date +%s)
+  elapsed=$((end - start))
+  expect_code 1 "$status" "spawn into a pane that never reaches a worktree should abort"
+  assert_contains "$out" "did not yield an isolated worktree" \
+    "settled non-worktree pane did not report the isolation refusal"
+  assert_absent "$HOME_DIR/state/$id.meta" "refused spawn must not record meta"
+  [ "$elapsed" -lt 30 ] || fail "settled non-worktree pane took ${elapsed}s to refuse - expected a prompt refusal, not the 60s timeout"
+  pass "a pane settled on a non-worktree path is refused promptly as an isolation failure"
+}
+
+# The guard must not over-refuse: a foreign path that persists for several reads
+# and THEN settles into the real worktree is still startup noise, and the spawn
+# must proceed. This is the case that would break every real spawn if the
+# prompt-refusal threshold were set too eagerly.
+test_multi_read_transient_still_settles() {
+  local rec id out status
+  id=settle-multi-stale-z4
+  rec=$(make_settle_case settle-multi-stale "$id" 3)
+  read_settle_record "$rec"
+
+  out=$(run_settle_spawn "$id")
+  status=$?
+  expect_code 0 "$status" "spawn should still succeed when a foreign path persists for several reads"
+  assert_contains "$out" "spawned $id" "spawn did not report success"
+  assert_grep "worktree=$WT_DIR" "$HOME_DIR/state/$id.meta" \
+    "meta did not record the settled worktree after a multi-read transient"
+  assert_no_grep "worktree=$STALE_DIR" "$HOME_DIR/state/$id.meta" \
+    "meta wrongly recorded the transient foreign path as the worktree"
+  pass "a foreign path persisting across several reads still settles into the real worktree"
+}
+
 test_single_stale_first_read_is_not_accepted
 test_already_settled_pane_costs_one_confirm_sleep
+test_settled_non_worktree_refuses_promptly
+test_multi_read_transient_still_settles
 
 echo "# all fm-spawn-worktree-settle tests passed"

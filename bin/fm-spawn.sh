@@ -1292,22 +1292,56 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # git repo but a DIFFERENT one) that would settle across two reads. Requiring a
   # worktree of the same repository rejects it while the loop keeps waiting,
   # instead of letting the isolation guard below abort the whole task.
+  #
+  # A path that is neither the project nor one of its worktrees is one of two
+  # things: transient shell-init noise, which clears on its own, or a genuinely
+  # wrong destination, which never will. Persistence is what separates them -
+  # not whether the path is a git repo, since a plain $HOME is just as plausible
+  # a startup cwd as ~/.oh-my-zsh. The observed transient lasted a single read,
+  # so requiring the SAME such path across FOREIGN_SETTLE_POLLS consecutive
+  # one-second reads outlasts startup noise by a wide margin and still refuses in
+  # seconds. Refusing here rather than falling through to the timeout matters:
+  # the timeout's generic "did not enter a worktree" reads as a hang, when this
+  # is the isolation guard refusing, and it is the same refusal
+  # validate_spawn_worktree makes below for a path the loop does accept.
+  FOREIGN_SETTLE_POLLS=${FM_SPAWN_FOREIGN_SETTLE_POLLS:-5}
   candidate=""
+  foreign=""
+  foreign_reads=0
   for _ in $(seq 1 60); do
     p=$(spawn_current_path "$WT_TARGET" || true)
     if [ -n "$p" ]; then
       p_real=$(real_path_or_raw "$p")
-      if [ "$p_real" != "$PROJ_ABS_REAL" ] && is_project_worktree "$p" "$PROJ_ABS"; then
+      if [ "$p_real" = "$PROJ_ABS_REAL" ]; then
+        # treehouse get has not moved the pane yet: keep waiting.
+        candidate=""
+        foreign=""
+        foreign_reads=0
+      elif is_project_worktree "$p" "$PROJ_ABS"; then
         if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
           WT="$p"
           break
         fi
         candidate="$p_real"
+        foreign=""
+        foreign_reads=0
       else
+        if [ -n "$foreign" ] && [ "$p_real" = "$foreign" ]; then
+          foreign_reads=$((foreign_reads + 1))
+        else
+          foreign="$p_real"
+          foreign_reads=1
+        fi
         candidate=""
+        if [ "$foreign_reads" -ge "$FOREIGN_SETTLE_POLLS" ]; then
+          echo "error: treehouse get did not yield an isolated worktree (pane settled at '$p'; not a worktree of the primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $T" >&2
+          exit 1
+        fi
       fi
     else
       candidate=""
+      foreign=""
+      foreign_reads=0
     fi
     sleep 1
   done
